@@ -17,18 +17,32 @@ def metadata():
         "tagline": "用行为窗口解释续读风险，再试算编辑关怀的覆盖边界。",
         "client": "纸岸知识出版社 · 6人内容运营组 · 320名匿名年度专栏读者",
         "workflow": "编辑每周合并阅读日志与到期续读结果，在表格中凭访问次数选择关怀对象。",
-        "pains": ["各行为量纲不同，人工排序偏向高频用户", "直接使用到期后的数据会泄漏结果", "风险阈值缺少精确率与召回率依据"],
+        "pains": ["各行为量纲不同，人工排序偏向高频用户", "直接使用到期后的数据会泄漏结果", "反复看留出成绩调参会高估续读预测效果", "风险阈值缺少精确率与召回率依据"],
         "upstream": "到期前14日阅读行为快照 reader_window_202611.csv",
-        "downstream": "主编据验证集覆盖人数安排内容回访实验，不自动触达读者",
-        "entities": ["读者行为样本", "续读风险试验", "编辑复核简报"],
+        "downstream": "主编据封存集一次性开封成绩安排内容回访实验，不自动触达读者",
+        "entities": ["读者行为样本", "盲评续读风险试验", "编辑复核简报"],
         "dataset_name": "纸岸专栏到期前14日匿名样本",
         "columns": [{"key": "reader_id", "label": "匿名读者", "type": "string"}] + [{"key": k, "label": l, "type": "number"} for k, l in zip(FEATURES, LABELS)] + [{"key": "renewed", "label": "实际续读(1/0)", "type": "number"}],
         "parameters": [{"key": "threshold", "label": "高风险概率阈值", "type": "number", "default": 0.5, "min": 0.1, "max": 0.9}, {"key": "regularization", "label": "模型C（越小正则越强）", "type": "number", "default": 1.0, "min": 0.01, "max": 10}],
         "workbench_title": "续读风险阈值试验", "action_label": "训练并复核覆盖范围", "unit": "位读者",
         "accent": "oklch(53% 0.12 30)", "style": "editorial-press",
         "seed_story": ["08:40 编辑导入 reader_window_202611.csv 的320条匿名样本", "08:45 检查14日访问、完成率、未读天数和已读期数", "09:00 以0.5风险阈值创建一次续读试验", "09:01 系统固定随机种子42，分层保留25%样本做验证", "09:05 编辑比较AUC、召回率与高风险人数", "09:10 将阈值改为0.7，复核误报减少及漏报增加", "09:20 下载验证明细交主编", "10:00 管理员设置周一08:30内部复核简报"],
-        "method": "分层75/25留出；仅在训练集拟合StandardScaler和L2 logistic回归；目标为1-renewed；阈值只用于验证集决策。",
+        "method": "负责人导入盲评批次并按读者固定开发集/封存集；分析员只用开发集训练与比较候选；选定候选时锁定训练成果与阈值，再一次性开封封存集。",
         "limitations": ["模拟读者行为，不能当作真实留存效果", "相关系数与模型系数不代表因果", "未包含时间外验证或干预效果评估"],
+        "blind": {
+            "batch_title": "盲评专用批次",
+            "development_label": "开发集",
+            "sealed_label": "封存集",
+            "case_stages": [{"key": "developing", "label": "开发中"}, {"key": "locked", "label": "已锁定"}, {"key": "unsealing", "label": "开封中"}, {"key": "completed", "label": "已完成"}],
+            "rules": [
+                "同一批次的首个盲评立案会按读者固定开发集与封存集，后续候选沿用同一分组。",
+                "同一读者只能进入一个盲评案件，避免封存标签在别处被再次查看。",
+                "分析员创建的候选试验只能绑定开发集批次，封存标签在选定候选前不参与任何训练或比较。",
+                "选定候选时一次性锁定训练成果与阈值；一案只接纳一次选择，并发选择只接受先落定者。",
+                "开封中断可恢复，重试沿用锁定成果和原分组，不新增评估、不重新训练或抽人。",
+                "开封结果完整落定后才供批准与简报使用；失败保留为待恢复状态。",
+            ],
+        },
     }
 
 
@@ -46,7 +60,7 @@ def seed_records():
     return rows
 
 
-def analyze(records, params):
+def _prepare(records, params):
     try:
         threshold = float(params.get("threshold", 0.5))
         c_value = float(params.get("regularization", 1.0))
@@ -67,6 +81,12 @@ def analyze(records, params):
     counts = np.bincount(y, minlength=2)
     if counts.min() < 8:
         raise ValueError("续读与未续读两类各至少8条样本。")
+    return threshold, c_value, x, y
+
+
+def fit_artifact(records, params):
+    """Fit once and return both the development display result and a locked model snapshot."""
+    threshold, c_value, x, y = _prepare(records, params)
     indices = np.arange(len(records))
     train, valid = train_test_split(indices, test_size=0.25, stratify=y, random_state=42)
     model = make_pipeline(StandardScaler(), LogisticRegression(C=c_value, max_iter=1000, random_state=42))
@@ -78,14 +98,94 @@ def analyze(records, params):
     recall = float(recall_score(y[valid], prediction, zero_division=0))
     tn, fp, fn, tp = [int(v) for v in confusion_matrix(y[valid], prediction, labels=[0, 1]).ravel()]
     coefficients = model[-1].coef_[0]
+    scaler = model[0]
     order = np.argsort(-probability)
     rows = [{"reader_id": str(records[int(valid[j])].get("reader_id", f"row-{int(valid[j])+1}")), "risk_pct": round(float(probability[j]) * 100, 2), "decision": "建议编辑复核" if prediction[j] else "维持观察", "actual": "未续读" if y[valid[j]] else "已续读"} for j in order]
     strongest = int(np.argmax(np.abs(coefficients)))
-    return {
+    result = {
         "summary": f"训练{len(train)}条、独立验证{len(valid)}条；阈值{threshold:.2f}下有{int(prediction.sum())}位进入编辑复核。",
         "metrics": [{"label": "验证AUC", "value": round(auc, 4)}, {"label": "风险召回率", "value": round(recall * 100, 2), "unit": "%"}, {"label": "风险精确率", "value": round(precision * 100, 2), "unit": "%"}, {"label": "验证集高风险", "value": int(prediction.sum()), "unit": "人"}],
         "table": {"columns": [{"key": "reader_id", "label": "匿名读者"}, {"key": "risk_pct", "label": "风险概率(%)"}, {"key": "decision", "label": "阈值决策"}, {"key": "actual", "label": "留出集实际结果"}], "rows": rows},
         "chart": {"type": "bar", "labels": LABELS, "series": [{"name": "标准化log-odds系数", "values": [round(float(v), 4) for v in coefficients]}]},
         "findings": [f"验证混淆矩阵：命中未续读{tp}、误报{fp}、漏报{fn}、正确排除{tn}。", f"绝对系数最大的特征为{LABELS[strongest]}（{float(coefficients[strongest]):.3f}）；正值意味着更高未续读风险。", f"验证准确率{accuracy_score(y[valid], prediction)*100:.1f}%；阈值变更影响覆盖边界，不改变AUC。"],
         "method": metadata()["method"], "warnings": ["风险排序供编辑复核使用，不能据此断言某项行为导致未续读。"],
+    }
+    artifact = {
+        "features": list(FEATURES),
+        "scaler_mean": [float(v) for v in scaler.mean_],
+        "scaler_scale": [float(v) for v in scaler.scale_],
+        "coef": [float(v) for v in coefficients],
+        "intercept": float(model[-1].intercept_[0]),
+        "threshold": threshold,
+        "regularization": c_value,
+        "random_state": 42,
+        "train_size": int(len(train)),
+        "valid_size": int(len(valid)),
+        "seed_42_split": True,
+    }
+    return result, artifact
+
+
+def analyze(records, params):
+    return fit_artifact(records, params)[0]
+
+
+def split_blind(records, seed=42, sealed_ratio=0.25):
+    """Fix development/sealed readers once, stratified by the renewal label."""
+    _, _, _, y = _prepare(records, {})
+    indices = np.arange(len(records))
+    dev, sealed = train_test_split(indices, test_size=sealed_ratio, stratify=y, random_state=seed)
+    dev_ids = [str(records[int(i)].get("reader_id", f"row-{int(i)+1}")) for i in dev]
+    sealed_ids = [str(records[int(i)].get("reader_id", f"row-{int(i)+1}")) for i in sealed]
+    return (
+        [records[int(i)] for i in dev],
+        [records[int(i)] for i in sealed],
+        {"seed": seed, "sealed_ratio": sealed_ratio, "development_readers": dev_ids, "sealed_readers": sealed_ids},
+    )
+
+
+
+def apply_artifact(records, artifact):
+    """Score records with a locked artifact only; never fits, splits or resamples."""
+    try:
+        expected = list(artifact["features"])
+        mean = np.asarray([float(v) for v in artifact["scaler_mean"]])
+        scale = np.asarray([float(v) for v in artifact["scaler_scale"]])
+        coef = np.asarray([float(v) for v in artifact["coef"]])
+        intercept = float(artifact["intercept"])
+        threshold = float(artifact["threshold"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("锁定的训练成果不完整，无法开封。") from exc
+    if expected != list(FEATURES) or not np.isfinite(mean).all() or not np.isfinite(scale).all() or not np.isfinite(coef).all() or not np.isfinite(intercept) or (scale <= 0).any():
+        raise ValueError("锁定的训练成果不可用，无法开封。")
+    if len(mean) != len(FEATURES) or len(coef) != len(FEATURES):
+        raise ValueError("锁定的训练成果与特征口径不一致，无法开封。")
+    try:
+        x = np.asarray([[float(row[k]) for k in FEATURES] for row in records])
+        renewed = np.asarray([float(row["renewed"]) for row in records])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("封存集行为字段与续读标签必须完整且为数值。") from exc
+    if not np.isfinite(x).all() or not np.isin(renewed, [0, 1]).all() or (x < 0).any() or (x[:, 1] > 100).any():
+        raise ValueError("封存集行为值必须非负且有限，完成率0~100，续读标签只能为0/1。")
+    y = 1 - renewed.astype(int)
+    if len(set(y.tolist())) < 2:
+        raise ValueError("封存集须同时包含已续读与未续读样本，才能形成完整评估。")
+    z = ((x - mean) / scale) @ coef + intercept
+    probability = 1.0 / (1.0 + np.exp(-z))
+    prediction = (probability >= threshold).astype(int)
+    auc = float(roc_auc_score(y, probability))
+    precision = float(precision_score(y, prediction, zero_division=0))
+    recall = float(recall_score(y, prediction, zero_division=0))
+    accuracy = float(accuracy_score(y, prediction))
+    tn, fp, fn, tp = [int(v) for v in confusion_matrix(y, prediction, labels=[0, 1]).ravel()]
+    order = np.argsort(-probability)
+    rows = [{"reader_id": str(records[int(j)].get("reader_id", f"row-{int(j)+1}")), "risk_pct": round(float(probability[j]) * 100, 2), "decision": "建议编辑复核" if prediction[j] else "维持观察", "actual": "未续读" if y[j] else "已续读"} for j in order]
+    return {
+        "summary": f"封存集{len(records)}位读者一次性开封；沿用锁定阈值{threshold:.2f}，命中未续读{tp}、误报{fp}、漏报{fn}。",
+        "metrics": [{"label": "封存集AUC", "value": round(auc, 4)}, {"label": "封存集召回率", "value": round(recall * 100, 2), "unit": "%"}, {"label": "封存集精确率", "value": round(precision * 100, 2), "unit": "%"}, {"label": "封存集高风险", "value": int(prediction.sum()), "unit": "人"}],
+        "table": {"columns": [{"key": "reader_id", "label": "匿名读者"}, {"key": "risk_pct", "label": "风险概率(%)"}, {"key": "decision", "label": "阈值决策"}, {"key": "actual", "label": "封存集实际结果"}], "rows": rows},
+        "chart": {"type": "bar", "labels": ["命中未续读", "误报", "漏报", "正确排除"], "series": [{"name": "封存集混淆矩阵", "values": [tp, fp, fn, tn]}]},
+        "findings": [f"封存集混淆矩阵：命中未续读{tp}、误报{fp}、漏报{fn}、正确排除{tn}。", f"封存集准确率{accuracy*100:.1f}%；AUC {auc:.4f} 与开发集留出成绩的差距用于判断调参是否过拟合。", f"阈值与模型在选定候选时已锁定；本次开封未重新训练、未重新抽人。"],
+        "method": "使用选定候选时锁定的标准化、L2 logistic系数与阈值，仅对导入时固定的封存集读者一次性评分。",
+        "warnings": ["封存集成绩只反映一次固定划分下的模拟表现，不能替代时间外验证或因果实验。"],
     }

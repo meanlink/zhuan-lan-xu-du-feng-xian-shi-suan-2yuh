@@ -8,3 +8,12 @@ class JobStatus(str, Enum):
     running = 'running'
     completed = 'completed'
     failed = 'failed'
+class JobScope(str, Enum):
+    standard = 'standard'
+    development = 'development'
+    sealed = 'sealed'
+class CaseStatus(str, Enum):
+    developing = 'developing'
+    locked = 'locked'
+    unsealing = 'unsealing'
+    completed = 'completed'
